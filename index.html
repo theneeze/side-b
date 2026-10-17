@@ -718,6 +718,8 @@ async function claude({system,prompt,maxTokens=4000,onText}){
   const r=await fetch('/api/claude',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+t},
     body:JSON.stringify({system,max_tokens:maxTokens,messages:[{role:'user',content:prompt}]})});
   if(!r.ok){let m=`Selector error ${r.status}`;try{const j=await r.json();m=typeof j.error==='string'?j.error:(j.error?.message||m)}catch(e){}throw new Error(m)}
+  const ct=r.headers.get('content-type')||'';
+  if(!ct.includes('event-stream')){const t=await r.text();throw new Error('Unexpected reply from the selector: '+t.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,160))}
   const reader=r.body.getReader(),dec=new TextDecoder();let buf='',out='';
   for(;;){
     const {done,value}=await reader.read(); if(done)break;
@@ -994,9 +996,10 @@ function matchTrack(items,want){
   const ok=items.filter(t=>t.artists.some(x=>{const n=norm(x.name);return n&&(wa.includes(n)||n.includes(wa))}));
   return ok.find(t=>{const n=norm(t.name);return n===wt||n.startsWith(wt)||wt.startsWith(n)})||ok[0]||null;
 }
+let lastSearchErr='';
 async function resolveTrack(want){
   const q1=`track:${want.t} artist:${want.a.split(/,| & | feat\.? /i)[0]}`;
-  let r=await sp('/search?type=track&limit=5&q='+encodeURIComponent(q1)).catch(()=>null);
+  let r=await sp('/search?type=track&limit=5&q='+encodeURIComponent(q1)).catch(e=>{lastSearchErr=e.message;return null});
   let t=matchTrack(r?.tracks?.items||[],want);
   if(!t){r=await sp('/search?type=track&limit=5&q='+encodeURIComponent(`${want.a} ${want.t}`)).catch(()=>null);t=matchTrack(r?.tracks?.items||[],want)}
   if(!t)return null;
@@ -1040,19 +1043,38 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
       const pct=need?Math.min(100,Math.round(resolved/need*100)):0;
       $('#results').innerHTML=progressHTML(st.tracks.length,`${total} chosen · ${resolved} found on Spotify · ${fmtMin(totalMs())} of ${hours}h so far`,pct);
     };
-    const handleLine=line=>{
-      line=line.trim().replace(/^```(json)?|```$/g,'').trim(); if(!line.startsWith('{'))return;
-      let o;try{o=JSON.parse(line)}catch(e){return}
-      if(o.title&&!o.a){st.title=o.title;st.desc=o.desc||'';return}
-      if(!o.a||!o.t)return;
-      const tr={a:String(o.a),t:String(o.t),n:+o.n?1:0};
+    const seenPick=new Set();
+    const takeObj=o=>{
+      if(!o||typeof o!=='object')return;
+      const a=o.a||o.artist, t=o.t||o.track||o.song||(a?o.title:null);
+      if(!a&&o.title){if(!st.title){st.title=String(o.title);st.desc=String(o.desc||o.description||'')}return}
+      if(!a||!t)return;
+      const k=norm(a)+'|'+norm(t); if(seenPick.has(k))return; seenPick.add(k);
+      const tr={a:String(a),t:String(t),n:+(o.n??o.new??0)?1:0};
       st.tracks.push(tr); total++; q.push(tr); update();
+    };
+    const handleLine=line=>{
+      line=line.trim().replace(/^```(json)?/,'').replace(/```$/,'').trim().replace(/^\[\s*/,'').replace(/\s*\]$/,'').replace(/,\s*$/,'').trim();
+      if(!line.startsWith('{'))return;
+      let o;try{o=JSON.parse(line)}catch(e){return}
+      if(Array.isArray(o.tracks)){takeObj(o);o.tracks.forEach(takeObj);return}
+      takeObj(o);
     };
     const txt=await claude({system,prompt,maxTokens:Math.min(16000,need*45+400),onText:out=>{
       const lines=out.split('\n'); for(;processed<lines.length-1;processed++)handleLine(lines[processed]);
     }});
     const lines=txt.split('\n'); for(;processed<lines.length;processed++)handleLine(lines[processed]);
+    if(!total){
+      // fallback: pull any {"a":..,"t":..} objects out of whatever shape came back
+      const tm=txt.match(/"title"\s*:\s*"([^"]+)"/); if(tm&&!st.title)st.title=tm[1];
+      for(const m of txt.match(/\{[^{}]*\}/g)||[]){try{takeObj(JSON.parse(m))}catch(e){}}
+    }
+    if(!total){
+      await q.close();
+      throw new Error(txt.trim()?`The selector replied but no tracks could be read. Its reply began: "${txt.trim().slice(0,160)}"`:'The selector sent back nothing. Check ANTHROPIC_API_KEY in Vercel, then redeploy.');
+    }
     await q.close();
+    if(!st.tracks.some(t=>t.res)) throw new Error(`None of the ${total} picks could be found on Spotify${lastSearchErr?` (Spotify said: ${lastSearchErr})`:''}.`);
     // keep order, drop misses and duplicates, trim to length
     const seen=new Set(); let acc=0; const kept=[];
     for(const t of st.tracks){
@@ -1066,8 +1088,8 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
     st.saved=null;
     renderStream();
   }catch(e){
-    if(st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=e.message;renderStream()}
-    else $('#results').innerHTML=`<div class="note err">${esc(e.message)}</div>`;
+    if(topUp&&st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=e.message;renderStream()}
+    else{S.stream=null;$('#results').innerHTML=`<div class="note err">${esc(e.message)}</div><button class="ghost" onclick="buildStream()">Try again</button>`}
   }finally{busy(false)}
 }
 const totalMs=()=>(S.stream?.tracks||[]).reduce((s,t)=>s+(t.res?.ms||0),0);
