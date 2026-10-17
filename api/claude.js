@@ -50,26 +50,46 @@ export async function POST(req) {
 
   if (!r.ok) return new Response(await r.text(), { status: r.status, headers: { 'content-type': 'application/json' } });
 
-  // ?buffer=1: read the whole stream here and return one JSON reply (sturdier on phones)
+  // ?buffer=1: read Claude's stream here and send one JSON reply. While Claude is
+  // thinking, a space goes out every 5s so phones don't drop the idle connection
+  // (JSON allows leading whitespace, so the client parses it as normal).
   if (new URL(req.url).searchParams.get('buffer') === '1') {
-    const reader = r.body.getReader();
-    const dec = new TextDecoder();
-    let buf = '', text = '', stop = '';
-    for (;;) {
-      const { done, value } = await reader.read();
-      if (done) break;
-      buf += dec.decode(value, { stream: true });
-      let i;
-      while ((i = buf.indexOf('\n')) >= 0) {
-        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
-        if (!line.startsWith('data:')) continue;
-        let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
-        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') text += ev.delta.text;
-        else if (ev.type === 'message_delta' && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
-        else if (ev.type === 'error') return json({ error: ev.error?.message || 'Claude stream error' }, 502);
-      }
-    }
-    return json({ text, stop });
+    const enc = new TextEncoder();
+    const upstream = r.body;
+    const out = new ReadableStream({
+      async start(controller) {
+        controller.enqueue(enc.encode(' '));
+        const ping = setInterval(() => { try { controller.enqueue(enc.encode(' ')); } catch {} }, 5000);
+        let result;
+        try {
+          const reader = upstream.getReader();
+          const dec = new TextDecoder();
+          let buf = '', text = '', stop = '', err = '';
+          for (;;) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buf += dec.decode(value, { stream: true });
+            let i;
+            while ((i = buf.indexOf('\n')) >= 0) {
+              const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+              if (!line.startsWith('data:')) continue;
+              let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+              if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') text += ev.delta.text;
+              else if (ev.type === 'message_delta' && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+              else if (ev.type === 'error') err = ev.error?.message || 'Claude stream error';
+            }
+          }
+          result = err ? { error: err } : { text, stop };
+        } catch (e) {
+          result = { error: 'Selector connection to Claude failed: ' + (e?.message || e) };
+        } finally {
+          clearInterval(ping);
+        }
+        controller.enqueue(enc.encode(JSON.stringify(result)));
+        controller.close();
+      },
+    });
+    return new Response(out, { headers: { 'content-type': 'application/json', 'cache-control': 'no-cache, no-transform', 'x-accel-buffering': 'no' } });
   }
 
   return new Response(r.body, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
