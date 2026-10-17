@@ -24,7 +24,7 @@ Both are picked by genre, era, mood and occasion; every list is editable in Tune
 4. **Vercel → Deployments** → the latest deployment's menu → Redeploy, so steps 2 and 3 take effect.
 5. **developer.spotify.com/dashboard** → your app → Settings → Redirect URIs → add
    `https://YOUR-PROJECT.vercel.app/` (with the trailing slash) → Save.
-   Same client ID as SELECTOR, or paste a new one in Tune → Settings.
+   Uses the SIDE B Spotify app (client ID built in). A different one can be pasted in Tune → Settings.
 6. Open the site in Safari → Share → **Add to Home Screen**.
 
 Every push to `main` redeploys automatically.
