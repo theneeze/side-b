@@ -49,5 +49,28 @@ export async function POST(req) {
   }
 
   if (!r.ok) return new Response(await r.text(), { status: r.status, headers: { 'content-type': 'application/json' } });
+
+  // ?buffer=1: read the whole stream here and return one JSON reply (sturdier on phones)
+  if (new URL(req.url).searchParams.get('buffer') === '1') {
+    const reader = r.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '', text = '', stop = '';
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
+        if (!line.startsWith('data:')) continue;
+        let ev; try { ev = JSON.parse(line.slice(5)); } catch { continue; }
+        if (ev.type === 'content_block_delta' && ev.delta?.type === 'text_delta') text += ev.delta.text;
+        else if (ev.type === 'message_delta' && ev.delta?.stop_reason) stop = ev.delta.stop_reason;
+        else if (ev.type === 'error') return json({ error: ev.error?.message || 'Claude stream error' }, 502);
+      }
+    }
+    return json({ text, stop });
+  }
+
   return new Response(r.body, { headers: { 'content-type': 'text/event-stream', 'cache-control': 'no-cache' } });
 }

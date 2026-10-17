@@ -479,7 +479,7 @@ textarea,.inp{width:100%;background:transparent;border:1px solid var(--ink);padd
         </div>
         <div class="section">
           <h3>Diagnostics</h3>
-          <p class="hint">Runs four short checks against the selector and Spotify, and shows where anything breaks.</p>
+          <p class="hint">Runs six short checks against the selector and Spotify, and shows where anything breaks.</p>
           <div class="btns"><button class="btn alt" id="diag-go">Test the selector</button></div>
           <pre id="diag-out" style="white-space:pre-wrap;font-size:12px;margin-top:12px;border:1px solid var(--line);padding:10px;display:none"></pre>
         </div>
@@ -724,10 +724,16 @@ async function claude({system,prompt,maxTokens=4000,onText}){
   const reqBody=JSON.stringify({system,max_tokens:maxTokens,messages:[{role:'user',content:prompt}]});
   const kb=Math.round(reqBody.length/1024);
   let r;
-  try{ r=await fetch('/api/claude',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+t},body:reqBody}); }
+  try{ r=await fetch('/api/claude?buffer=1',{method:'POST',headers:{'Content-Type':'application/json',Authorization:'Bearer '+t},body:reqBody}); }
   catch(e){ throw new Error(`${e.message} [before any reply, request ${kb} KB]`) }
   if(!r.ok){let m=`Selector error ${r.status}`;try{const j=await r.json();m=typeof j.error==='string'?j.error:(j.error?.message||m)}catch(e){}throw new Error(m)}
   const ct=r.headers.get('content-type')||'';
+  if(ct.includes('application/json')){
+    let j; try{ j=await r.json() }catch(e){ throw new Error(`${e.message} [reading reply, request ${kb} KB]`) }
+    if(j.error) throw new Error(typeof j.error==='string'?j.error:(j.error.message||'Selector error'));
+    claude.last={stop:j.stop||'',blocks:[],events:1};
+    const text=String(j.text||''); if(onText&&text)onText(text+'\n'); return text;
+  }
   if(!ct.includes('event-stream')){const t=await r.text();throw new Error('Unexpected reply from the selector: '+t.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,160))}
   const reader=r.body.getReader(),dec=new TextDecoder();let buf='',out='';
   const meta=claude.last={stop:'',blocks:[],events:0};
@@ -1479,22 +1485,28 @@ $('#sign-out').addEventListener('click',()=>{signOut();closeSheet($('#tune'));to
 $('#diag-go').addEventListener('click',async()=>{
   const out=$('#diag-out'), btn=$('#diag-go'); out.style.display='block'; btn.disabled=true;
   const log=t=>{out.textContent+=t+'\n'}; out.textContent='';
+  if(!S.lib||!S.lib.albums.length){log('Loading your Spotify library first…');await loadLibrary(true)}
   const vinyl='\n\nHER VINYL:\n'+coll().map(r=>`${r.artist} - ${r.title}`).join('; ');
+  const L=S.lib||{albums:[],playlists:[],topArtists:[]};
+  const albumsOnly='SAVED ALBUMS:\n'+L.albums.slice(0,150).map(a=>`${a.a} - ${a.t}`).join('\n');
+  const playlistsOnly='PLAYLIST NAMES: '+L.playlists.slice(0,40).map(p=>p.name).join('; ')+'\n'+L.playlists.filter(p=>p.own&&p.tracks.length).slice(0,10).map(p=>`"${p.name}": ${p.tracks.slice(0,8).join('; ')}`).join('\n');
   const ask='\n\nWrite 3 tracks she would like, one per line as {"a":"Artist","t":"Track"}. Nothing else.';
   const probes=[
     ['1 Tiny request', ()=>({system:'Reply briefly.',prompt:'Say OK.',maxTokens:20})],
     ['2 Light profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(true)+ask,maxTokens:300})],
-    ['3 Full profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(false)+vinyl+ask,maxTokens:300})],
+    ['3 Albums only', ()=>({system:'You are a music curator.',prompt:albumsOnly+ask,maxTokens:300})],
+    ['4 Playlists only', ()=>({system:'You are a music curator.',prompt:playlistsOnly+ask,maxTokens:300})],
+    ['5 Full profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(false)+vinyl+ask,maxTokens:300})],
   ];
-  log(`Spotify data: ${S.lib?.albums.length||0} albums, ${S.lib?.playlists.length||0} playlists`);
+  log(`Spotify data: ${S.lib?.albums.length||0} albums, ${S.lib?.playlists.length||0} playlists, ${S.lib?.topArtists.length||0} top artists`);
   for(const [name,mk] of probes){
     const t0=Date.now();
     try{ const a=mk(); const txt=await claude(a); log(`${name}: OK in ${((Date.now()-t0)/1000).toFixed(1)}s, ${Math.round(JSON.stringify(a).length/1024)} KB sent, reply "${txt.trim().slice(0,60).replace(/\n/g,' ')}"`) }
     catch(e){ log(`${name}: FAILED after ${((Date.now()-t0)/1000).toFixed(1)}s: ${e.message}`) }
   }
   const t0=Date.now();
-  try{ const r=await resolveTrack({a:'Kokoroko',t:'Abusey Junction'}); log(`4 Spotify search: ${r?'OK, found '+r.name:'no match'}${lastSearchErr?' ('+lastSearchErr+')':''} in ${((Date.now()-t0)/1000).toFixed(1)}s`) }
-  catch(e){ log(`4 Spotify search: FAILED: ${e.message}`) }
+  try{ const r=await resolveTrack({a:'Kokoroko',t:'Abusey Junction'}); log(`6 Spotify search: ${r?'OK, found '+r.name:'no match'}${lastSearchErr?' ('+lastSearchErr+')':''} in ${((Date.now()-t0)/1000).toFixed(1)}s`) }
+  catch(e){ log(`6 Spotify search: FAILED: ${e.message}`) }
   log('Done. Screenshot this and send it to Claude.');
   btn.disabled=false;
 });
