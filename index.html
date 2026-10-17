@@ -578,7 +578,7 @@ const S = {
   sync: 'local',
   status: {},
   wax: null,     // last vinyl session
-  stream: null,  // last playlist
+  stream: LS.get('stream', null),  // last playlist (or a paused build)
   busy: false,
 };
 if(!S.data.taxonomy) S.data.taxonomy = structuredClone(DEFAULT_TAX);
@@ -1041,8 +1041,10 @@ async function buildStream(extra){
   busy(true); setMode('stream');
   const topUp=!!extra;
   const hours=S.prefs.hours, targetMs=hours*36e5;
-  if(!topUp){ S.stream={title:'',desc:'',tracks:[],targetMs,hours,label:filterLabel(),discovery:S.prefs.discovery,at:Date.now()}; }
+  if(!topUp||!S.stream){ S.stream={title:'',desc:'',tracks:[],targetMs,hours,label:filterLabel(),discovery:S.prefs.discovery,at:Date.now()}; }
   const st=S.stream, goalMs=st.targetMs, ROUND=15;
+  st.building=true; st.error=null; keepAwake(true);
+  const persist=()=>LS.set('stream',S.stream);
   const okMs=()=>st.tracks.reduce((s,t)=>s+(t.res?.ms||0),0);
   $('#results').innerHTML=progressHTML(0,'Reading your taste…',0);
   try{
@@ -1052,9 +1054,13 @@ async function buildStream(extra){
     const system=`You are SIDE B, a DJ-minded music curator building Spotify playlists. ${VOICE} Follow the output format exactly.`;
     let round=0, chosen=st.tracks.length, roundAdded=0, lastErr='';
     const update=msg=>{
-      $('#results').innerHTML=progressHTML(st.tracks.filter(t=>t.res).length, msg||`Round ${round} · ${chosen} chosen · ${fmtMin(okMs())} of ${hours}h found on Spotify`, Math.min(100,Math.round(okMs()/goalMs*100)));
+      $('#results').innerHTML=progressHTML(st.tracks.filter(t=>t.res).length, msg||`Round ${round} · ${chosen} chosen · ${fmtMin(okMs())} of ${st.hours}h found on Spotify`, Math.min(100,Math.round(okMs()/goalMs*100)));
     };
-    const q=makeQueue(async tr=>{const res=await resolveTrack(tr);tr.res=res||false;update()},3);
+    const q=makeQueue(async tr=>{
+      const t0=Date.now(); let res=await resolveTrack(tr);
+      if(!res&&(document.hidden||hiddenSince>=t0)){ await whenVisible(); res=await resolveTrack(tr) }
+      tr.res=res||false; update();
+    },3);
     const seenPick=new Set(st.tracks.map(t=>norm(t.a)+'|'+norm(t.t)));
     const takeObj=o=>{
       if(!o||typeof o!=='object')return;
@@ -1087,7 +1093,7 @@ ${slim?slimProfile:profile}
 
 THE BRIEF:
 ${filterBrief()}
-Playlist length: ${hours} hours, written in rounds of ${ROUND} tracks. Discovery: about ${S.prefs.discovery}% of tracks should be music NOT in her library (close relatives of her taste, deep cuts, artists she would love); the rest from artists and albums she already saves or plays.
+Playlist length: ${st.hours} hours, written in rounds of ${ROUND} tracks. Discovery: about ${S.prefs.discovery}% of tracks should be music NOT in her library (close relatives of her taste, deep cuts, artists she would love); the rest from artists and albums she already saves or plays.
 ${recent.length?`
 SO FAR, the most recent tracks (continue the flow from the last one, repeat none):
 ${recent.join('\n')}
@@ -1100,19 +1106,23 @@ ${first?'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descripti
 "n" is 1 if the track is a discovery outside her library, 0 if it is from her library.`;
       roundAdded=0;
       for(let attempt=0;attempt<3&&!roundAdded;attempt++){
-        if(attempt){update(`Round ${round}: connection hiccup, retrying…`);await sleep(1500*attempt)}
-        let processed=0, txt='';
+        if(document.hidden){ await whenVisible(); update(`Round ${round}: picking up where it left off…`) }
+        else if(attempt){update(`Round ${round}: connection hiccup, retrying…`);await sleep(1500*attempt)}
+        let processed=0, txt=''; const t0=Date.now();
         try{
           txt=await claude({system,prompt:prompt(attempt===2),maxTokens:attempt?16000:8000,onText:out=>{const l=out.split('\n');for(;processed<l.length-1;processed++)handleLine(l[processed])}});
           const l=txt.split('\n'); for(;processed<l.length;processed++)handleLine(l[processed]);
           if(!st.title){const tm=txt.match(/"title"\s*:\s*"([^"]+)"\s*,\s*"desc(?:ription)?"\s*:\s*"([^"]*)"/);if(tm){st.title=tm[1];st.desc=tm[2]}}
           if(!roundAdded) for(const m of txt.match(/\{[^{}]*\}/g)||[]){try{takeObj(JSON.parse(m))}catch(e){}}
           if(!roundAdded) lastErr=txt.trim()?`unreadable reply: "${txt.trim().slice(0,120)}"`:(claude.last?.stop==='max_tokens'?'the selector ran out of room before writing (stop reason: max_tokens)':`empty reply (stop reason: ${claude.last?.stop||'none'})`);
-        }catch(e){ lastErr=friendlyErr(e.message) }
+        }catch(e){
+          lastErr=friendlyErr(e.message);
+          if(!roundAdded&&(document.hidden||hiddenSince>=t0)){ attempt--; await whenVisible(); update(`Round ${round}: picking up where it left off…`); continue }
+        }
       }
       if(!roundAdded){ if(++failedRounds>=2||!st.tracks.length)break; continue }
       failedRounds=0;
-      await q.drain(); update();
+      await q.drain(); update(); persist();
     }
     await q.drain();
     if(!st.tracks.length) throw new Error(`The selector couldn't write any tracks: ${lastErr}.`);
@@ -1126,17 +1136,18 @@ ${first?'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descripti
     st.missed=st.tracks.filter(t=>t.res===false).length;
     st.tracks=kept;
     st.error=(acc<goalMs-8*60000&&lastErr)?`Stopped early: ${lastErr}`:null;
-    if(!st.title) st.title=`${hours} hours, ${filterLabel()}`;
-    st.saved=null;
+    if(!st.title) st.title=`${st.hours} hours, ${st.label}`;
+    st.saved=null; st.building=false; persist();
     renderStream();
   }catch(e){
-    if(st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=friendlyErr(e.message);renderStream()}
-    else{S.stream=null;$('#results').innerHTML=`<div class="note err">${esc(friendlyErr(e.message))}</div><button class="ghost" onclick="buildStream()">Try again</button>`}
-  }finally{busy(false)}
+    st.building=false;
+    if(st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=friendlyErr(e.message);persist();renderStream()}
+    else{S.stream=null;LS.del('stream');$('#results').innerHTML=`<div class="note err">${esc(friendlyErr(e.message))}</div><button class="ghost" onclick="buildStream()">Try again</button>`}
+  }finally{busy(false);if(!tagBusy)keepAwake(false)}
 }
 const totalMs=()=>(S.stream?.tracks||[]).reduce((s,t)=>s+(t.res?.ms||0),0);
 function renderStream(){
-  const st=S.stream, ms=totalMs(), short=st.targetMs-ms>8*60000;
+  const st=S.stream, ms=totalMs(), paused=st.building&&!S.busy, short=!paused&&st.targetMs-ms>8*60000;
   const newCount=st.tracks.filter(t=>t.n).length;
   $('#results').innerHTML=`
     <div class="res-head"><div><div class="eyebrow">Stream · ${st.hours}h · ${esc(st.label)}</div><h2>${esc(st.title)}</h2>
@@ -1146,6 +1157,7 @@ function renderStream(){
         <button class="ghost" id="dl-txt">.txt</button><button class="ghost" id="copy-txt">Copy</button><button class="ghost" id="rebuild">Rebuild</button>
       </div></div>
     ${st.error?`<div class="note err">${esc(st.error)}</div>`:''}
+    ${paused?`<div class="note">Paused at ${fmtMin(ms)} of ${st.hours}h. <button class="link" id="resume">Resume</button></div>`:''}
     ${short?`<div class="note">Came up ${fmtMin(st.targetMs-ms)} short${st.missed?` (${st.missed} picks weren't on Spotify)`:''}. <button class="link" id="topup">Top it up</button></div>`:''}
     ${st.saveError?`<div class="note err">Spotify wouldn't create the playlist (${esc(st.saveError)}). Download the .txt and paste it into <a href="https://www.tunemymusic.com/transfer" target="_blank" rel="noopener">TuneMyMusic</a>, or copy the list.</div>`:''}
     <div class="tracks">${st.tracks.map((t,i)=>`<div class="trk" style="animation-delay:${Math.min(i,30)*15}ms" data-i="${i}">
@@ -1156,9 +1168,10 @@ function renderStream(){
   $('#rebuild').onclick=()=>buildStream();
   $('#dl-txt').onclick=downloadTxt; $('#copy-txt').onclick=copyTxt;
   const tu=$('#topup'); if(tu) tu.onclick=()=>buildStream(true);
+  const rs=$('#resume'); if(rs) rs.onclick=()=>buildStream(true);
   const sv=$('#save-pl'); if(sv) sv.onclick=savePlaylist;
 }
-$('#results').addEventListener('click',e=>{const x=e.target.closest('[data-rm]');if(!x)return;S.stream.tracks.splice(+x.dataset.rm,1);S.stream.saved=null;renderStream()});
+$('#results').addEventListener('click',e=>{const x=e.target.closest('[data-rm]');if(!x)return;S.stream.tracks.splice(+x.dataset.rm,1);S.stream.saved=null;LS.set('stream',S.stream);renderStream()});
 const txtList=()=>S.stream.tracks.map(t=>`${t.res.artist.split(', ')[0]} - ${t.res.name}`).join('\n');
 function downloadTxt(){const b=new Blob([txtList()],{type:'text/plain'});const a=document.createElement('a');a.href=URL.createObjectURL(b);a.download=(S.stream.title||'side-b').replace(/[^\w\- ]+/g,'').trim()+'.txt';a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1000)}
 async function copyTxt(){try{await navigator.clipboard.writeText(txtList());toast('Track list copied')}catch(e){toast('Copy failed')}}
@@ -1168,7 +1181,7 @@ async function savePlaylist(){
     const pl=await sp('/me/playlists',{method:'POST',body:JSON.stringify({name:st.title,description:`${st.desc||''} Made with SIDE B.`.trim(),public:false})});
     const uris=st.tracks.map(t=>t.res.uri);
     for(let i=0;i<uris.length;i+=100) await sp(`/playlists/${pl.id}/items`,{method:'POST',body:JSON.stringify({uris:uris.slice(i,i+100)})});
-    st.saved=pl.external_urls?.spotify||`https://open.spotify.com/playlist/${pl.id}`; st.saveError=null;
+    st.saved=pl.external_urls?.spotify||`https://open.spotify.com/playlist/${pl.id}`; st.saveError=null; LS.set('stream',st);
     toast('Saved to your Spotify'); loadLibrary(true);
   }catch(e){st.saveError=e.message}
   renderStream();
@@ -1207,6 +1220,13 @@ async function backgroundCovers(){
 /* ------------------------------------------------------------------ */
 /* Tagging (genre, original year, mood, occasion)                      */
 /* ------------------------------------------------------------------ */
+let wakeLock=null, hiddenSince=0;
+async function keepAwake(on){try{
+  if(on){ if('wakeLock' in navigator && !wakeLock){ wakeLock=await navigator.wakeLock.request('screen'); wakeLock.addEventListener('release',()=>{wakeLock=null}) } }
+  else if(wakeLock){ await wakeLock.release(); wakeLock=null }
+}catch(e){}}
+const whenVisible=()=>document.hidden?new Promise(r=>{const f=()=>{if(!document.hidden){document.removeEventListener('visibilitychange',f);r()}};document.addEventListener('visibilitychange',f)}):Promise.resolve();
+document.addEventListener('visibilitychange',()=>{ if(document.hidden) hiddenSince=Date.now(); else if(S.busy||tagBusy) keepAwake(true) });
 let tagBusy=false;
 function friendlyErr(m){return /load failed|failed to fetch|networkerror|network connection/i.test(m)?'connection dropped '+((m.match(/\[[^\]]*\]/)||[''])[0]):m}
 document.addEventListener('visibilitychange',()=>{
@@ -1214,7 +1234,7 @@ document.addEventListener('visibilitychange',()=>{
   const l=coll().filter(r=>!r.tagged); if(l.length) setTimeout(()=>tagRecords(l),800);
 });
 async function tagRecords(list){
-  if(tagBusy||!list.length||!S.tok)return; tagBusy=true;
+  if(tagBusy||!list.length||!S.tok)return; tagBusy=true; keepAwake(true);
   const T=tax(); const pick=(arr,allowed)=>{const m=new Map(allowed.map(x=>[x.toLowerCase(),x]));return [...new Set((arr||[]).map(x=>m.get(String(x).toLowerCase())).filter(Boolean))]};
   try{
     let failed=0,lastErr='';
@@ -1259,7 +1279,7 @@ Return {"records":[{"id":"...","artist":"...","title":"...","year":1972,"genres"
     if(left){setStatus('tag',`Tagging paused, ${left} to go (${lastErr}). It resumes when you reopen SIDE B`);if(!document.hidden)toast(`Tagging paused: ${lastErr}`)}
     else setStatus('tag',null);
   }catch(e){setStatus('tag',`Tagging stopped: ${e.message}`);toast('Tagging stopped: '+e.message)}
-  finally{tagBusy=false;$('#crate-count').textContent=coll().length}
+  finally{tagBusy=false;if(!S.busy)keepAwake(false);$('#crate-count').textContent=coll().length}
 }
 function dedupeAfterFill(){
   const seen=new Map(), drop=new Set();
