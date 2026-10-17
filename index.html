@@ -894,7 +894,7 @@ Pick exactly 10 records from THE CRATE only, using the ids given. Treat the filt
 
 Return:
 {"title":"a short evocative session title, 2-5 words","line":"one sentence on the arc of the session","picks":[{"id":"...","why":"max 18 words on why this record, now","needle":"one standout track to drop the needle on, only if you are certain it is on this album, otherwise empty","stretch":false}]}`;
-    const txt=await claude({system,prompt,maxTokens:3000});
+    const txt=await claude({system,prompt,maxTokens:8000});
     const j=extractJSON(txt);
     const byId=new Map(list.map(r=>[r.id,r]));
     const picks=(j.picks||[]).filter(p=>byId.has(p.id)).slice(0,10);
@@ -953,7 +953,7 @@ async function swapPick(id,btn){
     const before=S.wax.picks[idx-1], after=S.wax.picks[idx+1], byId=new Map(coll().map(r=>[r.id,r]));
     const ctx=[before&&`before it: ${byId.get(before.id)?.artist} - ${byId.get(before.id)?.title}`,after&&`after it: ${byId.get(after.id)?.artist} - ${byId.get(after.id)?.title}`].filter(Boolean).join('; ');
     const txt=await claude({system:`You are SIDE B, choosing a record from someone's own vinyl. ${VOICE} Reply with JSON only.`,
-      prompt:`CRATE:\n${crateLines(list)}\n\nBRIEF:\n${filterBrief()}\n\nReplace one slot in a session (${ctx||'standalone'}). Pick exactly 1 record from CRATE. Return {"id":"...","why":"max 18 words","needle":"track only if certain, else empty"}`,maxTokens:400});
+      prompt:`CRATE:\n${crateLines(list)}\n\nBRIEF:\n${filterBrief()}\n\nReplace one slot in a session (${ctx||'standalone'}). Pick exactly 1 record from CRATE. Return {"id":"...","why":"max 18 words","needle":"track only if certain, else empty"}`,maxTokens:4000});
     const j=extractJSON(txt);
     if(!coll().some(r=>r.id===j.id)) throw new Error('No swap found');
     S.wax.picks[idx]={id:j.id,why:j.why||'',needle:j.needle||''};
@@ -1042,7 +1042,7 @@ async function buildStream(extra){
   const topUp=!!extra;
   const hours=S.prefs.hours, targetMs=hours*36e5;
   if(!topUp){ S.stream={title:'',desc:'',tracks:[],targetMs,hours,label:filterLabel(),discovery:S.prefs.discovery,at:Date.now()}; }
-  const st=S.stream, goalMs=st.targetMs, ROUND=10;
+  const st=S.stream, goalMs=st.targetMs, ROUND=15;
   const okMs=()=>st.tracks.reduce((s,t)=>s+(t.res?.ms||0),0);
   $('#results').innerHTML=progressHTML(0,'Reading your taste…',0);
   try{
@@ -1103,11 +1103,11 @@ ${first?'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descripti
         if(attempt){update(`Round ${round}: connection hiccup, retrying…`);await sleep(1500*attempt)}
         let processed=0, txt='';
         try{
-          txt=await claude({system,prompt:prompt(attempt===2),maxTokens:900,onText:out=>{const l=out.split('\n');for(;processed<l.length-1;processed++)handleLine(l[processed])}});
+          txt=await claude({system,prompt:prompt(attempt===2),maxTokens:attempt?16000:8000,onText:out=>{const l=out.split('\n');for(;processed<l.length-1;processed++)handleLine(l[processed])}});
           const l=txt.split('\n'); for(;processed<l.length;processed++)handleLine(l[processed]);
           if(!st.title){const tm=txt.match(/"title"\s*:\s*"([^"]+)"\s*,\s*"desc(?:ription)?"\s*:\s*"([^"]*)"/);if(tm){st.title=tm[1];st.desc=tm[2]}}
           if(!roundAdded) for(const m of txt.match(/\{[^{}]*\}/g)||[]){try{takeObj(JSON.parse(m))}catch(e){}}
-          if(!roundAdded) lastErr=txt.trim()?`unreadable reply: "${txt.trim().slice(0,120)}"`:`empty reply (stop reason: ${claude.last?.stop||'none'})`;
+          if(!roundAdded) lastErr=txt.trim()?`unreadable reply: "${txt.trim().slice(0,120)}"`:(claude.last?.stop==='max_tokens'?'the selector ran out of room before writing (stop reason: max_tokens)':`empty reply (stop reason: ${claude.last?.stop||'none'})`);
         }catch(e){ lastErr=friendlyErr(e.message) }
       }
       if(!roundAdded){ if(++failedRounds>=2||!st.tracks.length)break; continue }
@@ -1234,7 +1234,7 @@ Rules: 1-3 genres, 2-4 moods, 2-4 occasions. "year" is the ORIGINAL release year
 RECORDS (id | artist | title | pressing year):
 ${batch.map(r=>[r.id,r.artist||'',r.title,r.year||''].join(' | ')).join('\n')}
 
-Return {"records":[{"id":"...","artist":"...","title":"...","year":1972,"genres":[],"moods":[],"occasions":[]}]}`,maxTokens:4000});
+Return {"records":[{"id":"...","artist":"...","title":"...","year":1972,"genres":[],"moods":[],"occasions":[]}]}`,maxTokens:12000});
       try{recs=extractJSON(txt).records||[]}catch(e){
         for(const m of txt.match(/\{[^{}]*"id"[^{}]*\}/g)||[]){try{recs.push(JSON.parse(m))}catch(e2){}}
       }
@@ -1492,11 +1492,11 @@ $('#diag-go').addEventListener('click',async()=>{
   const playlistsOnly='PLAYLIST NAMES: '+L.playlists.slice(0,40).map(p=>p.name).join('; ')+'\n'+L.playlists.filter(p=>p.own&&p.tracks.length).slice(0,10).map(p=>`"${p.name}": ${p.tracks.slice(0,8).join('; ')}`).join('\n');
   const ask='\n\nWrite 3 tracks she would like, one per line as {"a":"Artist","t":"Track"}. Nothing else.';
   const probes=[
-    ['1 Tiny request', ()=>({system:'Reply briefly.',prompt:'Say OK.',maxTokens:20})],
-    ['2 Light profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(true)+ask,maxTokens:300})],
-    ['3 Albums only', ()=>({system:'You are a music curator.',prompt:albumsOnly+ask,maxTokens:300})],
-    ['4 Playlists only', ()=>({system:'You are a music curator.',prompt:playlistsOnly+ask,maxTokens:300})],
-    ['5 Full profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(false)+vinyl+ask,maxTokens:300})],
+    ['1 Tiny request', ()=>({system:'Reply briefly.',prompt:'Say OK.',maxTokens:2000})],
+    ['2 Light profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(true)+ask,maxTokens:4000})],
+    ['3 Albums only', ()=>({system:'You are a music curator.',prompt:albumsOnly+ask,maxTokens:4000})],
+    ['4 Playlists only', ()=>({system:'You are a music curator.',prompt:playlistsOnly+ask,maxTokens:4000})],
+    ['5 Full profile', ()=>({system:'You are a music curator.',prompt:'HER LISTENING:\n'+libProfile(false)+vinyl+ask,maxTokens:4000})],
   ];
   log(`Spotify data: ${S.lib?.albums.length||0} albums, ${S.lib?.playlists.length||0} playlists, ${S.lib?.topArtists.length||0} top artists`);
   for(const [name,mk] of probes){
