@@ -1014,9 +1014,10 @@ async function resolveTrack(want){
   return {uri:t.uri,id:t.id,name:t.name,artist:t.artists.map(x=>x.name).join(', '),album:t.album?.name||'',img:(t.album?.images||[]).slice(-1)[0]?.url||'',ms:t.duration_ms||0};
 }
 function makeQueue(fn,conc=3){
-  const q=[];let active=0,idle;const done=new Promise(r=>idle=r);let closed=false;
-  const next=()=>{while(active<conc&&q.length){const job=q.shift();active++;fn(job).finally(()=>{active--;next();if(closed&&!active&&!q.length)idle()})}if(closed&&!active&&!q.length)idle()};
-  return {push(j){q.push(j);next()},close(){closed=true;next();return done}};
+  const q=[];let active=0,waiters=[];
+  const check=()=>{if(!active&&!q.length){waiters.forEach(w=>w());waiters=[]}};
+  const next=()=>{while(active<conc&&q.length){const job=q.shift();active++;Promise.resolve().then(()=>fn(job)).catch(()=>{}).finally(()=>{active--;next();check()})}};
+  return {push(j){q.push(j);next()},drain(){return new Promise(r=>{waiters.push(r);check()})}};
 }
 async function buildStream(extra){
   if(S.busy)return;
@@ -1025,33 +1026,20 @@ async function buildStream(extra){
   const topUp=!!extra;
   const hours=S.prefs.hours, targetMs=hours*36e5;
   if(!topUp){ S.stream={title:'',desc:'',tracks:[],targetMs,hours,label:filterLabel(),discovery:S.prefs.discovery,at:Date.now()}; }
-  const st=S.stream;
-  const need=topUp?Math.ceil((st.targetMs-totalMs())/60000/3.9)+4:Math.ceil(hours*60/3.9*1.15);
+  const st=S.stream, goalMs=st.targetMs, ROUND=10;
+  const okMs=()=>st.tracks.reduce((s,t)=>s+(t.res?.ms||0),0);
   $('#results').innerHTML=progressHTML(0,'Reading your taste…',0);
   try{
     if(!S.lib) await loadLibrary(true);
     const vinyl=S.prefs.vinylSeeds?'\n\nHER VINYL (also a strong taste signal):\n'+coll().map(r=>`${r.artist} - ${r.title}`).join('; '):'';
-    const existing=st.tracks.map(t=>`${t.a} - ${t.t}`);
+    const profile=libProfile(false)+vinyl, slimProfile=libProfile(true);
     const system=`You are SIDE B, a DJ-minded music curator building Spotify playlists. ${VOICE} Follow the output format exactly.`;
-    const makePrompt=slim=>`HER LISTENING:
-${libProfile(slim)}${slim?'':vinyl}
-
-THE BRIEF:
-${filterBrief()}
-Length: about ${hours} hours. Discovery: about ${S.prefs.discovery}% of tracks should be music NOT in her library (close relatives of her taste, deep cuts, artists she would love); the rest from artists and albums she already saves or plays.
-${topUp?`\nThis is a TOP-UP. The playlist already has these tracks, do not repeat any and continue the flow from the last one:\n${existing.join('\n')}\n`:''}
-Write exactly ${need} tracks, sequenced for flow: open with intent, build, vary tempo and texture, land softly. Never the same artist back to back, at most one track per artist per hour. Real released tracks only, canonical titles, primary artist names, no remaster or version suffixes.
-
-OUTPUT FORMAT, nothing else, no code fences:
-${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line description"}\n'}Then one line per track: {"a":"Artist","t":"Track title","n":1}
-"n" is 1 if the track is a discovery outside her library, 0 if it is from her library.`;
-    let processed=0, total=0, resolved=0;
-    const q=makeQueue(async tr=>{const res=await resolveTrack(tr);tr.res=res||false;resolved++;update()},3);
-    const update=()=>{
-      const pct=need?Math.min(100,Math.round(resolved/need*100)):0;
-      $('#results').innerHTML=progressHTML(st.tracks.length,`${total} chosen · ${resolved} found on Spotify · ${fmtMin(totalMs())} of ${hours}h so far`,pct);
+    let round=0, chosen=st.tracks.length, roundAdded=0, lastErr='';
+    const update=msg=>{
+      $('#results').innerHTML=progressHTML(st.tracks.filter(t=>t.res).length, msg||`Round ${round} · ${chosen} chosen · ${fmtMin(okMs())} of ${hours}h found on Spotify`, Math.min(100,Math.round(okMs()/goalMs*100)));
     };
-    const seenPick=new Set();
+    const q=makeQueue(async tr=>{const res=await resolveTrack(tr);tr.res=res||false;update()},3);
+    const seenPick=new Set(st.tracks.map(t=>norm(t.a)+'|'+norm(t.t)));
     const takeObj=o=>{
       if(!o||typeof o!=='object')return;
       const a=o.a||o.artist, t=o.t||o.track||o.song||(a?o.title:null);
@@ -1059,7 +1047,7 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
       if(!a||!t)return;
       const k=norm(a)+'|'+norm(t); if(seenPick.has(k))return; seenPick.add(k);
       const tr={a:String(a),t:String(t),n:+(o.n??o.new??0)?1:0};
-      st.tracks.push(tr); total++; q.push(tr); update();
+      st.tracks.push(tr); chosen++; roundAdded++; q.push(tr); update();
     };
     const handleLine=line=>{
       line=line.trim().replace(/^```(json)?/,'').replace(/```$/,'').trim().replace(/^\[\s*/,'').replace(/\s*\]$/,'').replace(/,\s*$/,'').trim();
@@ -1068,24 +1056,51 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
       if(Array.isArray(o.tracks)){takeObj(o);o.tracks.forEach(takeObj);return}
       takeObj(o);
     };
-    const run=slim=>{processed=0;return claude({system,prompt:makePrompt(slim),maxTokens:Math.min(16000,need*45+400),onText:out=>{
-      const lines=out.split('\n'); for(;processed<lines.length-1;processed++)handleLine(lines[processed]);
-    }})};
-    let txt=await run(false);
-    if(!txt.trim()){ $('#results').innerHTML=progressHTML(0,'First try came back empty, trying a lighter brief…',0); txt=await run(true); }
-    const lines=txt.split('\n'); for(;processed<lines.length;processed++)handleLine(lines[processed]);
-    if(!total){
-      // fallback: pull any {"a":..,"t":..} objects out of whatever shape came back
-      const tm=txt.match(/"title"\s*:\s*"([^"]+)"/); if(tm&&!st.title)st.title=tm[1];
-      for(const m of txt.match(/\{[^{}]*\}/g)||[]){try{takeObj(JSON.parse(m))}catch(e){}}
+    const maxRounds=Math.ceil(goalMs/60000/3.9/ROUND)+5;
+    let failedRounds=0;
+    while(okMs()<goalMs-90000 && round<maxRounds){
+      round++;
+      const minsLeft=Math.max(5,Math.round((goalMs-okMs())/60000));
+      const recent=st.tracks.slice(-12).map(t=>`${t.a} - ${t.t}`);
+      const used=[...new Set(st.tracks.map(t=>t.a))].slice(-80);
+      const first=!st.title;
+      const done=okMs()/goalMs;
+      const stage=done<0.2?'the opening: set the tone with intent':done<0.75?'the middle: build, vary tempo and texture':'the closing stretch: ease down and land softly';
+      const prompt=slim=>`HER LISTENING:
+${slim?slimProfile:profile}
+
+THE BRIEF:
+${filterBrief()}
+Playlist length: ${hours} hours, written in rounds of ${ROUND} tracks. Discovery: about ${S.prefs.discovery}% of tracks should be music NOT in her library (close relatives of her taste, deep cuts, artists she would love); the rest from artists and albums she already saves or plays.
+${recent.length?`
+SO FAR, the most recent tracks (continue the flow from the last one, repeat none):
+${recent.join('\n')}
+Artists already used (avoid repeats unless the playlist is long): ${used.join('; ')}
+`:''}
+Write the next ${ROUND} tracks. This round is ${stage}. About ${minsLeft} minutes still to fill. Never the same artist back to back. Real released tracks only, canonical titles, primary artist names, no remaster or version suffixes.
+
+OUTPUT FORMAT, nothing else, no code fences:
+${first?'Line 1: {"title":"playlist title, 2-5 words","desc":"one line description"}\n':''}Then one line per track: {"a":"Artist","t":"Track title","n":1}
+"n" is 1 if the track is a discovery outside her library, 0 if it is from her library.`;
+      roundAdded=0;
+      for(let attempt=0;attempt<3&&!roundAdded;attempt++){
+        if(attempt){update(`Round ${round}: connection hiccup, retrying…`);await sleep(1500*attempt)}
+        let processed=0, txt='';
+        try{
+          txt=await claude({system,prompt:prompt(attempt===2),maxTokens:900,onText:out=>{const l=out.split('\n');for(;processed<l.length-1;processed++)handleLine(l[processed])}});
+          const l=txt.split('\n'); for(;processed<l.length;processed++)handleLine(l[processed]);
+          if(!st.title){const tm=txt.match(/"title"\s*:\s*"([^"]+)"\s*,\s*"desc(?:ription)?"\s*:\s*"([^"]*)"/);if(tm){st.title=tm[1];st.desc=tm[2]}}
+          if(!roundAdded) for(const m of txt.match(/\{[^{}]*\}/g)||[]){try{takeObj(JSON.parse(m))}catch(e){}}
+          if(!roundAdded) lastErr=txt.trim()?`unreadable reply: "${txt.trim().slice(0,120)}"`:`empty reply (stop reason: ${claude.last?.stop||'none'})`;
+        }catch(e){ lastErr=friendlyErr(e.message) }
+      }
+      if(!roundAdded){ if(++failedRounds>=2||!st.tracks.length)break; continue }
+      failedRounds=0;
+      await q.drain(); update();
     }
-    if(!total){
-      await q.close();
-      throw new Error(txt.trim()?`The selector replied but no tracks could be read. Its reply began: "${txt.trim().slice(0,160)}"`:`The selector sent back an empty reply twice (stop reason: ${claude.last?.stop||'none'}; blocks: ${(claude.last?.blocks||[]).join(', ')||'none'}; events: ${claude.last?.events??0}). Send this to Claude.`);
-    }
-    await q.close();
-    if(!st.tracks.some(t=>t.res)) throw new Error(`None of the ${total} picks could be found on Spotify${lastSearchErr?` (Spotify said: ${lastSearchErr})`:''}.`);
-    // keep order, drop misses and duplicates, trim to length
+    await q.drain();
+    if(!st.tracks.length) throw new Error(`The selector couldn't write any tracks: ${lastErr}.`);
+    if(!st.tracks.some(t=>t.res)) throw new Error(`None of the ${st.tracks.length} picks could be found on Spotify${lastSearchErr?` (Spotify said: ${lastSearchErr})`:''}.`);
     const seen=new Set(); let acc=0; const kept=[];
     for(const t of st.tracks){
       if(!t.res||seen.has(t.res.uri))continue; seen.add(t.res.uri);
@@ -1094,12 +1109,13 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
     }
     st.missed=st.tracks.filter(t=>t.res===false).length;
     st.tracks=kept;
+    st.error=(acc<goalMs-8*60000&&lastErr)?`Stopped early: ${lastErr}`:null;
     if(!st.title) st.title=`${hours} hours, ${filterLabel()}`;
     st.saved=null;
     renderStream();
   }catch(e){
-    if(topUp&&st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=e.message;renderStream()}
-    else{S.stream=null;$('#results').innerHTML=`<div class="note err">${esc(e.message)}</div><button class="ghost" onclick="buildStream()">Try again</button>`}
+    if(st.tracks.some(t=>t.res)){st.tracks=st.tracks.filter(t=>t.res);st.error=friendlyErr(e.message);renderStream()}
+    else{S.stream=null;$('#results').innerHTML=`<div class="note err">${esc(friendlyErr(e.message))}</div><button class="ghost" onclick="buildStream()">Try again</button>`}
   }finally{busy(false)}
 }
 const totalMs=()=>(S.stream?.tracks||[]).reduce((s,t)=>s+(t.res?.ms||0),0);
