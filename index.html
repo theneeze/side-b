@@ -721,6 +721,7 @@ async function claude({system,prompt,maxTokens=4000,onText}){
   const ct=r.headers.get('content-type')||'';
   if(!ct.includes('event-stream')){const t=await r.text();throw new Error('Unexpected reply from the selector: '+t.replace(/<[^>]+>/g,' ').replace(/\s+/g,' ').trim().slice(0,160))}
   const reader=r.body.getReader(),dec=new TextDecoder();let buf='',out='';
+  const meta=claude.last={stop:'',blocks:[],events:0};
   for(;;){
     const {done,value}=await reader.read(); if(done)break;
     buf+=dec.decode(value,{stream:true});
@@ -728,6 +729,9 @@ async function claude({system,prompt,maxTokens=4000,onText}){
       const line=buf.slice(0,i).trim(); buf=buf.slice(i+1);
       if(!line.startsWith('data:'))continue;
       let ev; try{ev=JSON.parse(line.slice(5))}catch(e){continue}
+      meta.events++;
+      if(ev.type==='content_block_start')meta.blocks.push(ev.content_block?.type);
+      if(ev.type==='message_delta'&&ev.delta?.stop_reason)meta.stop=ev.delta.stop_reason;
       if(ev.type==='content_block_delta'&&ev.delta?.type==='text_delta'){out+=ev.delta.text;onText&&onText(out)}
       else if(ev.type==='error')throw new Error(ev.error?.message||'Selector stream failed');
     }
@@ -974,16 +978,20 @@ async function loadLibrary(force){
   }catch(e){setStatus('lib',`Spotify read failed: ${e.message}`)}
   renderStatus();
 }
-function libProfile(){
+function libProfile(slim){
   const L=S.lib; if(!L) return 'No Spotify data available.';
+  if(slim) return [
+    L.topArtists.length&&'TOP ARTISTS: '+L.topArtists.slice(0,60).map(a=>a.n).join('; '),
+    L.albums.length&&'SAVED ALBUMS (sample): '+L.albums.slice(0,80).map(a=>`${a.a} - ${a.t}`).join('; ')
+  ].filter(Boolean).join('\n\n');
   const parts=[];
   if(L.topArtists.length) parts.push('TOP ARTISTS (most played first):\n'+L.topArtists.slice(0,90).map(a=>a.n+(a.g.length?` [${a.g.join(', ')}]`:'')).join('; '));
-  if(L.albums.length) parts.push(`SAVED ALBUMS (${L.albums.length}, newest first, sample):\n`+L.albums.slice(0,260).map(a=>`${a.a} - ${a.t}${a.y?` (${a.y})`:''}`).join('\n'));
+  if(L.albums.length) parts.push(`SAVED ALBUMS (${L.albums.length}, newest first, sample):\n`+L.albums.slice(0,150).map(a=>`${a.a} - ${a.t}${a.y?` (${a.y})`:''}`).join('\n'));
   if(L.topTracks.length) parts.push('TOP TRACKS:\n'+L.topTracks.join('\n'));
   if(L.recent.length) parts.push('RECENTLY PLAYED:\n'+L.recent.slice(0,30).join('\n'));
   const own=L.playlists.filter(p=>p.own);
-  if(L.playlists.length) parts.push('PLAYLIST NAMES: '+L.playlists.slice(0,80).map(p=>p.name).join('; '));
-  const samples=own.filter(p=>p.tracks.length).slice(0,15).map(p=>`"${p.name}": ${p.tracks.slice(0,10).join('; ')}`);
+  if(L.playlists.length) parts.push('PLAYLIST NAMES: '+L.playlists.slice(0,40).map(p=>p.name).join('; '));
+  const samples=own.filter(p=>p.tracks.length).slice(0,10).map(p=>`"${p.name}": ${p.tracks.slice(0,8).join('; ')}`);
   if(samples.length) parts.push('FROM HER OWN PLAYLISTS:\n'+samples.join('\n'));
   return parts.join('\n\n');
 }
@@ -1025,8 +1033,8 @@ async function buildStream(extra){
     const vinyl=S.prefs.vinylSeeds?'\n\nHER VINYL (also a strong taste signal):\n'+coll().map(r=>`${r.artist} - ${r.title}`).join('; '):'';
     const existing=st.tracks.map(t=>`${t.a} - ${t.t}`);
     const system=`You are SIDE B, a DJ-minded music curator building Spotify playlists. ${VOICE} Follow the output format exactly.`;
-    const prompt=`HER LISTENING:
-${libProfile()}${vinyl}
+    const makePrompt=slim=>`HER LISTENING:
+${libProfile(slim)}${slim?'':vinyl}
 
 THE BRIEF:
 ${filterBrief()}
@@ -1060,9 +1068,11 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
       if(Array.isArray(o.tracks)){takeObj(o);o.tracks.forEach(takeObj);return}
       takeObj(o);
     };
-    const txt=await claude({system,prompt,maxTokens:Math.min(16000,need*45+400),onText:out=>{
+    const run=slim=>{processed=0;return claude({system,prompt:makePrompt(slim),maxTokens:Math.min(16000,need*45+400),onText:out=>{
       const lines=out.split('\n'); for(;processed<lines.length-1;processed++)handleLine(lines[processed]);
-    }});
+    }})};
+    let txt=await run(false);
+    if(!txt.trim()){ $('#results').innerHTML=progressHTML(0,'First try came back empty, trying a lighter brief…',0); txt=await run(true); }
     const lines=txt.split('\n'); for(;processed<lines.length;processed++)handleLine(lines[processed]);
     if(!total){
       // fallback: pull any {"a":..,"t":..} objects out of whatever shape came back
@@ -1071,7 +1081,7 @@ ${topUp?'':'Line 1: {"title":"playlist title, 2-5 words","desc":"one line descri
     }
     if(!total){
       await q.close();
-      throw new Error(txt.trim()?`The selector replied but no tracks could be read. Its reply began: "${txt.trim().slice(0,160)}"`:'The selector sent back nothing. Check ANTHROPIC_API_KEY in Vercel, then redeploy.');
+      throw new Error(txt.trim()?`The selector replied but no tracks could be read. Its reply began: "${txt.trim().slice(0,160)}"`:`The selector sent back an empty reply twice (stop reason: ${claude.last?.stop||'none'}; blocks: ${(claude.last?.blocks||[]).join(', ')||'none'}; events: ${claude.last?.events??0}). Send this to Claude.`);
     }
     await q.close();
     if(!st.tracks.some(t=>t.res)) throw new Error(`None of the ${total} picks could be found on Spotify${lastSearchErr?` (Spotify said: ${lastSearchErr})`:''}.`);
