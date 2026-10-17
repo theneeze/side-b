@@ -1,0 +1,7 @@
+{
+  "name": "side-b",
+  "private": true,
+  "version": "1.0.0",
+  "type": "module",
+  "description": "SIDE B: ten records from your crate, or a 2, 4 or 6-hour Spotify playlist"
+}
