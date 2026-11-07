@@ -220,6 +220,9 @@ input[type=range]{width:100%;accent-color:var(--accent);margin-top:10px}
 .cr .tg span{font-size:10px;font-weight:600;color:var(--muted);border:1px solid var(--line);padding:1px 5px}
 .cr .tg span.untagged{color:var(--accent);border-color:var(--accent)}
 .cr .ops{display:flex;gap:4px}
+.cr.saved{grid-template-columns:1fr auto;padding:12px 0}
+.cr.saved .ops{align-items:center}
+.cr.saved .ghost{padding:7px 10px}
 .icon-btn{width:34px;height:34px;display:grid;place-items:center;border:1px solid var(--line);color:var(--text2)}
 .icon-btn:hover{border-color:var(--ink);color:var(--text)}
 .icon-btn.del:hover{color:var(--danger);border-color:var(--danger)}
@@ -395,6 +398,7 @@ textarea,.inp{width:100%;background:transparent;border:1px solid var(--ink);padd
     </header>
     <div class="tabs" role="tablist">
       <button data-tab="records" aria-selected="true">Records</button>
+      <button data-tab="saved" aria-selected="false">Saved</button>
       <button data-tab="add" aria-selected="false">Add</button>
       <button data-tab="backup" aria-selected="false">Backup</button>
     </div>
@@ -410,6 +414,10 @@ textarea,.inp{width:100%;background:transparent;border:1px solid var(--ink);padd
         </div>
         <div class="hint" id="crate-meta" style="margin-bottom:8px"></div>
         <div class="crate-list" id="crate-list"></div>
+      </div>
+      <div data-pane="saved" hidden>
+        <p class="hint" style="margin-bottom:10px">Lists of ten you have saved. They sync across your devices.</p>
+        <div class="crate-list" id="saved-list"></div>
       </div>
       <div data-pane="add" hidden>
         <div class="section">
@@ -577,12 +585,14 @@ const S = {
   me: LS.get('me', null),
   sync: 'local',
   status: {},
-  wax: null,     // last vinyl session
+  wax: LS.get('wax', null),     // last vinyl session (kept across refreshes)
   stream: LS.get('stream', null),  // last playlist (or a paused build)
   busy: false,
 };
 if(!S.data.taxonomy) S.data.taxonomy = structuredClone(DEFAULT_TAX);
 if(!S.data.history) S.data.history = [];
+if(!S.data.saved) S.data.saved = [];
+const keepWax = ()=>{ if(S.wax) LS.set('wax',S.wax); else LS.del('wax') };
 const tax = ()=>S.data.taxonomy;
 const coll = ()=>S.data.collection;
 function savePrefs(){LS.set('prefs',S.prefs)}
@@ -698,7 +708,7 @@ async function pullRemote(){
     const remote=await r.json();
     S.sync='on';
     if(remote && remote.updatedAt>(S.data.updatedAt||0)){
-      S.data=remote; if(!S.data.history)S.data.history=[]; if(!S.data.taxonomy)S.data.taxonomy=structuredClone(DEFAULT_TAX);
+      S.data=remote; if(!S.data.history)S.data.history=[]; if(!S.data.saved)S.data.saved=[]; if(!S.data.taxonomy)S.data.taxonomy=structuredClone(DEFAULT_TAX);
       LS.set('data',S.data); renderAll();
     } else if(!remote || remote.updatedAt<(S.data.updatedAt||0) || !S.data.updatedAt){
       if(!S.data.updatedAt) S.data.updatedAt=Date.now();
@@ -899,23 +909,24 @@ Return:
     const byId=new Map(list.map(r=>[r.id,r]));
     const picks=(j.picks||[]).filter(p=>byId.has(p.id)).slice(0,10);
     if(!picks.length) throw new Error('No records came back, try again');
-    S.wax={title:j.title||'Ten for now',line:j.line||'',picks,at:Date.now(),label:filterLabel()};
+    S.wax={title:j.title||'Ten for now',line:j.line||'',picks,at:Date.now(),label:filterLabel()}; keepWax();
     logHistory(picks.map(p=>p.id),'pick');
     renderWax();
     fetchCovers(picks.map(p=>byId.get(p.id)),{render:true});
   }catch(e){
     const pool=(anySel()?coll().filter(r=>r.tagged&&matches(r)):coll());
     const fallback=(pool.length>=4?pool:coll()).slice().sort(()=>Math.random()-.5).slice(0,10);
-    S.wax={title:'Straight from the crate',line:'A random pull from your tagged matches while the selector is unavailable.',picks:fallback.map(r=>({id:r.id,why:'',needle:''})),at:Date.now(),label:filterLabel(),error:e.message};
+    S.wax={title:'Straight from the crate',line:'A random pull from your tagged matches while the selector is unavailable.',picks:fallback.map(r=>({id:r.id,why:'',needle:''})),at:Date.now(),label:filterLabel(),error:e.message}; keepWax();
     renderWax();
   }finally{busy(false)}
 }
 function renderWax(){
   const w=S.wax, byId=new Map(coll().map(r=>[r.id,r]));
   const spun=new Set(S.data.history.filter(h=>h.kind==='spun'&&h.at>=w.at).map(h=>h.id));
+  const isSaved=!!(w.savedId&&S.data.saved.some(x=>x.id===w.savedId));
   $('#results').innerHTML=`
     <div class="res-head"><div><div class="eyebrow">Vinyl · ${esc(w.label)}</div><h2>${esc(w.title)}</h2>${w.line?`<p>${esc(w.line)}</p>`:''}</div>
-      <div class="res-actions"><button class="ghost" id="wax-again">Pull again</button></div></div>
+      <div class="res-actions"><button class="ghost" id="wax-save">${isSaved?'Saved':'Save list'}</button><button class="ghost" id="wax-again">Pull again</button></div></div>
     ${w.error?`<div class="note err">${esc(w.error)}</div>`:''}
     <div class="grid">${w.picks.map((p,i)=>{const r=byId.get(p.id);if(!r)return'';
       const sp=r.spId?`https://open.spotify.com/album/${r.spId}`:`https://open.spotify.com/search/${encodeURIComponent(r.artist+' '+r.title)}`;
@@ -932,7 +943,47 @@ function renderWax(){
           <a class="mini" href="${sp}" target="_blank" rel="noopener">Spotify</a>
         </div></article>`}).join('')}</div>`;
   $('#wax-again').onclick=pullWax;
+  $('#wax-save').onclick=saveWaxList;
 }
+function saveWaxList(){
+  const w=S.wax; if(!w||!w.picks.length) return;
+  if(w.savedId&&S.data.saved.some(x=>x.id===w.savedId)){toast('Already saved. Find it in Crate, Saved');return}
+  const byId=new Map(coll().map(r=>[r.id,r]));
+  const item={id:uid(),title:w.title,line:w.line||'',label:w.label||'',at:Date.now(),
+    picks:w.picks.map(p=>({id:p.id,why:p.why||'',needle:p.needle||'',stretch:!!p.stretch,artist:byId.get(p.id)?.artist||'',rtitle:byId.get(p.id)?.title||''}))};
+  S.data.saved.unshift(item); S.data.saved=S.data.saved.slice(0,200);
+  w.savedId=item.id; keepWax(); saveData({silent:true}); renderWax(); toast('Saved. Find it in Crate, Saved');
+}
+function renderSaved(){
+  const list=S.data.saved||[];
+  $('#saved-list').innerHTML=list.map(x=>{
+    const d=new Date(x.at).toLocaleDateString('en-GB',{day:'numeric',month:'short',year:'numeric'});
+    const names=x.picks.map(p=>p.artist).filter(Boolean);
+    const sub=[...new Set(names)].slice(0,4).join(', ')+(new Set(names).size>4?'…':'');
+    return `<div class="cr saved" data-sid="${esc(x.id)}">
+      <div><b>${esc(x.title)}</b><div class="sub">${esc(d)} · ${x.picks.length} records${x.label?' · '+esc(x.label):''}</div>
+        <div class="sub">${esc(sub)}</div></div>
+      <div class="ops"><button class="ghost" data-sop="open">Open</button>
+        <button class="icon-btn del" data-sop="del" aria-label="Delete"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M4 7h16M10 11v6M14 11v6M6 7l1 13h10l1-13M9 7V4h6v3"/></svg></button></div></div>`}).join('')
+    ||'<p class="hint">No saved lists yet. After pulling ten records, tap Save list.</p>';
+}
+$('#saved-list').addEventListener('click',e=>{
+  const b=e.target.closest('[data-sop]'); if(!b)return;
+  const id=b.closest('.saved').dataset.sid, x=S.data.saved.find(v=>v.id===id); if(!x)return;
+  if(b.dataset.sop==='del'){
+    if(!confirm(`Delete "${x.title}"?`))return;
+    S.data.saved=S.data.saved.filter(v=>v.id!==id);
+    if(S.wax&&S.wax.savedId===id){S.wax.savedId=null;keepWax()}
+    saveData({silent:true}); renderSaved(); if(S.wax)renderWax(); return;
+  }
+  const have=new Set(coll().map(r=>r.id));
+  const picks=x.picks.filter(p=>have.has(p.id)).map(p=>({id:p.id,why:p.why,needle:p.needle,stretch:p.stretch}));
+  if(!picks.length){toast('Those records are no longer in the crate');return}
+  S.wax={title:x.title,line:x.line,picks,at:Date.now(),label:x.label,savedId:x.id}; keepWax();
+  closeSheet($('#crate')); setMode('wax'); renderWax();
+  fetchCovers(picks.map(p=>coll().find(r=>r.id===p.id)),{render:true});
+  if(picks.length<x.picks.length)toast(`${x.picks.length-picks.length} removed from the crate since`);
+});
 $('#results').addEventListener('click',async e=>{
   const b=e.target.closest('.rec [data-act]'); if(!b)return;
   const id=b.closest('.rec').dataset.id;
@@ -940,7 +991,7 @@ $('#results').addEventListener('click',async e=>{
     const has=S.data.history.some(h=>h.kind==='spun'&&h.id===id&&h.at>=S.wax.at);
     if(has){S.data.history=S.data.history.filter(h=>!(h.kind==='spun'&&h.id===id&&h.at>=S.wax.at));saveData({silent:true})}
     else logHistory([id],'spun');
-    renderWax();
+    keepWax(); renderWax();
   }
   if(b.dataset.act==='swap') swapPick(id,b);
 });
@@ -956,7 +1007,7 @@ async function swapPick(id,btn){
       prompt:`CRATE:\n${crateLines(list)}\n\nBRIEF:\n${filterBrief()}\n\nReplace one slot in a session (${ctx||'standalone'}). Pick exactly 1 record from CRATE. Return {"id":"...","why":"max 18 words","needle":"track only if certain, else empty"}`,maxTokens:4000});
     const j=extractJSON(txt);
     if(!coll().some(r=>r.id===j.id)) throw new Error('No swap found');
-    S.wax.picks[idx]={id:j.id,why:j.why||'',needle:j.needle||''};
+    S.wax.picks[idx]={id:j.id,why:j.why||'',needle:j.needle||''}; S.wax.savedId=null; keepWax();
     logHistory([j.id],'pick'); renderWax(); fetchCovers([byId.get(j.id)],{render:true});
   }catch(e){toast(e.message);renderWax()}finally{busy(false)}
 }
@@ -1290,7 +1341,7 @@ function dedupeAfterFill(){
 /* ------------------------------------------------------------------ */
 /* Crate: list, edit, remove                                           */
 /* ------------------------------------------------------------------ */
-wireTabs($('#crate'),t=>{S.prefs.crateTab=t;savePrefs();if(t==='backup')renderBackup()});
+wireTabs($('#crate'),t=>{S.prefs.crateTab=t;savePrefs();if(t==='backup')renderBackup();if(t==='saved')renderSaved()});
 $('#btn-crate').addEventListener('click',()=>{renderCrate();openSheet('crate');selectTab($('#crate'),S.prefs.crateTab||'records')});
 $('#crate-q').addEventListener('input',renderCrate);
 $('#crate-sort').addEventListener('change',renderCrate);
@@ -1321,7 +1372,7 @@ $('#crate-list').addEventListener('click',e=>{
 function removeRecord(id){
   const r=coll().find(x=>x.id===id);
   S.data.collection=coll().filter(x=>x.id!==id); saveData(); renderCrate(); renderStatus();
-  if(S.wax){S.wax.picks=S.wax.picks.filter(p=>p.id!==id);}
+  if(S.wax){S.wax.picks=S.wax.picks.filter(p=>p.id!==id);keepWax();}
   toast(`Removed ${r?.title||'record'}`);
 }
 let editing=null;
@@ -1439,7 +1490,7 @@ $('#import-json').addEventListener('change',async e=>{
   const f=e.target.files[0]; e.target.value=''; if(!f)return;
   try{const d=JSON.parse(await f.text());if(!Array.isArray(d.collection))throw new Error('Not a SIDE B backup');
     if(!confirm(`Replace the crate with this backup (${d.collection.length} records)?`))return;
-    S.data={...freshData(),...d}; saveData(); renderAll(); toast('Backup restored')}catch(err){toast(err.message)}
+    S.data={...freshData(),...d}; if(!S.data.saved)S.data.saved=[]; saveData(); renderAll(); toast('Backup restored')}catch(err){toast(err.message)}
 });
 
 /* ------------------------------------------------------------------ */
